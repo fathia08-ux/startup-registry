@@ -5,10 +5,11 @@ const { Pool } = require('pg');
 const path = require('path');
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+console.log('DATABASE_URL is:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -16,7 +17,10 @@ const pool = new Pool({
 });
 
 async function initDB() {
-  await pool.query(`
+  console.log('Connecting to DB...');
+  const client = await pool.connect();
+  console.log('Connected! Creating table...');
+  await client.query(`
     CREATE TABLE IF NOT EXISTS startups (
       id         SERIAL PRIMARY KEY,
       name       TEXT NOT NULL,
@@ -32,21 +36,16 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
-  console.log('DB ready');
+  client.release();
+  console.log('DB ready!');
 }
 
 app.get('/api/startups', async (req, res) => {
   const { q } = req.query;
   try {
-    let result;
-    if (q) {
-      result = await pool.query(
-        `SELECT * FROM startups WHERE name ILIKE $1 OR domain ILIKE $1 ORDER BY created_at DESC`,
-        [`%${q}%`]
-      );
-    } else {
-      result = await pool.query(`SELECT * FROM startups ORDER BY created_at DESC`);
-    }
+    const result = q
+      ? await pool.query(`SELECT * FROM startups WHERE name ILIKE $1 OR domain ILIKE $1 ORDER BY created_at DESC`, [`%${q}%`])
+      : await pool.query(`SELECT * FROM startups ORDER BY created_at DESC`);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -69,40 +68,6 @@ app.post('/api/startups', async (req, res) => {
   }
 });
 
-app.post('/api/startups/:id/enrich', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { rows } = await pool.query(`SELECT * FROM startups WHERE id = $1`, [id]);
-    if (!rows.length) return res.status(404).json({ error: 'Not found' });
-    const startup = rows[0];
-    const apiKey = process.env.CRUNCHBASE_API_KEY;
-    if (!apiKey) return res.status(400).json({ error: 'CRUNCHBASE_API_KEY not set' });
-    const axios = require('axios');
-    const response = await axios.post(
-      'https://api.crunchbase.com/api/v4/searches/organizations',
-      {
-        field_ids: ['identifier', 'short_description', 'funding_total', 'last_funding_type', 'location_identifiers', 'categories', 'website_url'],
-        query: [{ type: 'predicate', field_id: 'domain_name', operator_id: 'eq', values: [startup.domain] }],
-        limit: 1
-      },
-      { headers: { 'X-cb-user-key': apiKey } }
-    );
-    const org = response.data?.entities?.[0];
-    if (!org) return res.status(404).json({ error: 'Not found on Crunchbase' });
-    const p = org.properties;
-    const country = p.location_identifiers?.find(l => l.location_type === 'country')?.value || null;
-    const funding = p.funding_total?.value_usd ? `$${(p.funding_total.value_usd / 1e6).toFixed(1)}M` : null;
-    const tags = (p.categories || []).map(c => c.value).slice(0, 4).join(', ') || null;
-    const updated = await pool.query(
-      `UPDATE startups SET description=COALESCE($2,description), country=COALESCE($3,country), stage=COALESCE($4,stage), funding=COALESCE($5,funding), tags=COALESCE($6,tags), website=COALESCE($7,website), enriched=TRUE WHERE id=$1 RETURNING *`,
-      [id, p.short_description, country, p.last_funding_type, funding, tags, p.website_url]
-    );
-    res.json(updated.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.delete('/api/startups/:id', async (req, res) => {
   try {
     await pool.query(`DELETE FROM startups WHERE id = $1`, [req.params.id]);
@@ -121,5 +86,6 @@ initDB().then(() => {
   app.listen(PORT, () => console.log(`Running on port ${PORT}`));
 }).catch(err => {
   console.error('DB init failed:', err.message);
+  console.error('Full error:', JSON.stringify(err, null, 2));
   process.exit(1);
 });
